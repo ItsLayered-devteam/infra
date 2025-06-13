@@ -1,5 +1,5 @@
 import { SSTConfig } from "sst";
-import { Api, Cron, NextjsSite, RDS, EventBus, Config, Function } from "sst/constructs";
+import { Api, Cron, NextjsSite, RDS, EventBus, Config, Function, Queue } from "sst/constructs";
 
 export default {
   config(_input) {
@@ -22,60 +22,89 @@ export default {
     const currentEnv = isProd ? 'prod' : isStaging ? 'staging' : 'dev';
     const config = envConfig[currentEnv];
 
-    app.stack(function Database({ stack }) {
-      const supabaseUrl = new Config.Secret(stack, "SUPABASE_URL");
-      const supabaseAnonKey = new Config.Secret(stack, "SUPABASE_ANON_KEY");
-      const databaseUrl = new Config.Secret(stack, "DATABASE_URL");
-      const directUrl = new Config.Secret(stack, "DIRECT_URL");
-      return { supabaseUrl, supabaseAnonKey, databaseUrl, directUrl };
-    });
+    app.stack(function AppStack({ stack }) {
+      const database = {
+        supabaseUrl: new Config.Secret(stack, "SUPABASE_URL"),
+        supabaseAnonKey: new Config.Secret(stack, "SUPABASE_ANON_KEY"),
+        supabaseJwtSecret: new Config.Secret(stack, "SUPABASE_JWT_SECRET"),
+        databaseUrl: new Config.Secret(stack, "DATABASE_URL"),
+        directUrl: new Config.Secret(stack, "DIRECT_URL"),
+      };
 
-    app.stack(function APIs({ stack }) {
-      const { supabaseUrl, supabaseAnonKey, databaseUrl, directUrl } = app.use(Database);
+      const shopifyWebhookQueue = new Queue(stack, "ShopifyWebhookQueue", {
+        consumer: {
+          function: {
+            handler: "../backend-api/dist/jobs/shopify-webhook.handler.handler",
+            bind: [database.databaseUrl, database.directUrl],
+          },
+        },
+      });
+
       const sharedEnv = { NODE_ENV: isProd ? "production" : "development", LOG_LEVEL: config.logLevel };
 
       const backendAPI = new Api(stack, "backend-api", {
         defaults: {
           function: {
             runtime: "nodejs18.x",
-            timeout: config.timeout,
-            memorySize: config.memorySize,
+            timeout: config.timeout as any,
+            memorySize: config.memorySize as any,
             environment: { ...sharedEnv, PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK: "1" },
-            bind: [supabaseUrl, supabaseAnonKey, databaseUrl, directUrl],
+            bind: [
+              database.supabaseUrl, 
+              database.supabaseAnonKey, 
+              database.databaseUrl, 
+              database.directUrl,
+              shopifyWebhookQueue,
+            ],
           },
         },
         routes: { "ANY /{proxy+}": { function: { handler: "../backend-api/dist/lambda.handler" } } },
       });
 
-      return { backendAPIUrl: backendAPI.url };
-    });
+      const mobileBff = new Api(stack, "mobile-bff", {
+        defaults: {
+          function: {
+            runtime: "nodejs18.x",
+            timeout: config.timeout as any,
+            memorySize: config.memorySize as any,
+            environment: { ...sharedEnv },
+            bind: [
+              database.supabaseUrl,
+              database.supabaseAnonKey,
+              database.supabaseJwtSecret,
+              database.databaseUrl,
+              database.directUrl,
+              backendAPI,
+            ],
+          },
+        },
+        routes: { "ANY /{proxy+}": { function: { handler: "../mobile-bff/dist/lambda.main" } } },
+      });
 
-    app.stack(function Jobs({ stack }) {
-      const { databaseUrl, directUrl } = app.use(Database);
       new Cron(stack, "expire-points-job", {
         schedule: "cron(0 */4 * * ? *)",
         job: {
           function: {
-            handler: "../backend-api/src/jobs/expire-points.handler.handler",
+            handler: "../backend-api/dist/jobs/expire-points.handler.handler",
             runtime: "nodejs18.x",
             timeout: "5 minutes",
             memorySize: "1024 MB",
-            environment: { DATABASE_URL: databaseUrl.value, DIRECT_URL: directUrl.value, PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK: "1" },
-            bind: [databaseUrl, directUrl],
+            environment: { 
+              DATABASE_URL: (database.databaseUrl as any).value, 
+              DIRECT_URL: (database.directUrl as any).value, 
+              PRISMA_SCHEMA_DISABLE_ADVISORY_LOCK: "1" 
+            },
+            bind: [database.databaseUrl, database.directUrl],
           },
         },
       });
-    });
 
-    app.stack(function Frontend({ stack }) {
-      const { backendAPIUrl } = app.use(APIs);
-      const { supabaseUrl, supabaseAnonKey } = app.use(Database);
       new NextjsSite(stack, "admin-dashboard", {
         path: "../frontend-web-admin",
         environment: {
-          NEXT_PUBLIC_BACKEND_API_URL: backendAPIUrl,
-          NEXT_PUBLIC_SUPABASE_URL: supabaseUrl.value,
-          NEXT_PUBLIC_SUPABASE_ANON_KEY: supabaseAnonKey.value,
+          NEXT_PUBLIC_BACKEND_API_URL: backendAPI.url,
+          NEXT_PUBLIC_SUPABASE_URL: (database.supabaseUrl as any).value,
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: (database.supabaseAnonKey as any).value,
         },
         customDomain: config.domain ? { domainName: config.domain } : undefined,
       });
